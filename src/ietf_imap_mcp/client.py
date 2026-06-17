@@ -221,6 +221,11 @@ class IetfImapConfig:
     min_interval: float = field(
         default_factory=lambda: float(os.environ.get("IETF_IMAP_MIN_INTERVAL", DEFAULT_MIN_INTERVAL))
     )
+    # On imap.ietf.org the lists live under "Shared Folders/<list>". A bare list
+    # name (no "/") gets this prefix; full paths are passed through unchanged.
+    mailbox_prefix: str = field(
+        default_factory=lambda: os.environ.get("IETF_IMAP_MAILBOX_PREFIX", "Shared Folders/")
+    )
 
     def resolved_password(self) -> str:
         """For anonymous access the password is an email address."""
@@ -267,12 +272,21 @@ class IetfImapClient:
                     self._conn = None
                     self._selected = None
 
+    def _normalize(self, name: str) -> str:
+        """Map a bare list name to its full mailbox path (idempotent)."""
+        name = name.strip().strip('"')
+        prefix = self.config.mailbox_prefix
+        if prefix and "/" not in name:
+            return prefix + name
+        return name
+
     def _examine(self, mailbox: str) -> int:
         """Open a mailbox read-only; return the message count."""
         conn = self._connect()
         if self._selected != mailbox:
             self._rl.wait()
-            typ, data = conn.examine(_mailbox_arg(mailbox))
+            # readonly=True makes imaplib issue EXAMINE (never modifies the mailbox).
+            typ, data = conn.select(_mailbox_arg(mailbox), readonly=True)
             if typ != "OK":
                 raise ImapError(f"Could not open mailbox {mailbox!r}: {_first(data)}")
             self._selected = mailbox
@@ -285,7 +299,8 @@ class IetfImapClient:
         with self._lock:
             conn = self._connect()
             self._rl.wait()
-            typ, data = conn.list("", pattern)
+            # imap.ietf.org requires quoted reference + pattern.
+            typ, data = conn.list('""', _quote(pattern))
             if typ != "OK":
                 raise ImapError(f"LIST failed: {_first(data)}")
             names = [_parse_list_line(line) for line in data if line]
@@ -304,6 +319,7 @@ class IetfImapClient:
         limit: int = 25,
     ) -> dict:
         limit = clamp_results(limit)
+        mailbox = self._normalize(mailbox)
         with self._lock:
             total = self._examine(mailbox)
             charset, criteria = build_search_criteria(subject, from_addr, text, since, before)
@@ -327,6 +343,7 @@ class IetfImapClient:
 
     def page(self, mailbox: str, offset: int = 0, limit: int = 25) -> dict:
         limit = clamp_results(limit)
+        mailbox = self._normalize(mailbox)
         with self._lock:
             total = self._examine(mailbox)
             rng = compute_page_range(total, offset, limit)
@@ -355,6 +372,7 @@ class IetfImapClient:
             }
 
     def get_message(self, mailbox: str, uid: str | int, include_body=True, max_body_chars=20000) -> dict:
+        mailbox = self._normalize(mailbox)
         with self._lock:
             self._examine(mailbox)
             conn = self._connect()

@@ -37,10 +37,11 @@ class FakeIMAP:
         lines = [f'(\\HasNoChildren) "." "{name}"'.encode() for name in self.mailboxes]
         return ("OK", lines)
 
-    def examine(self, mailbox):
+    def select(self, mailbox, readonly=False):
         name = mailbox.strip('"')
         self.selected = name
-        self.commands.append(f"EXAMINE {name}")
+        # imaplib issues EXAMINE on the wire when readonly=True.
+        self.commands.append(f"{'EXAMINE' if readonly else 'SELECT'} {name}")
         return ("OK", [str(len(self.mailboxes.get(name, []))).encode()])
 
     def uid(self, command, *args):
@@ -93,8 +94,8 @@ def fake_mailboxes():
 @pytest.fixture
 def client(fake_mailboxes):
     fake = FakeIMAP(fake_mailboxes)
-    # No real sleeping in tests.
-    cfg = IetfImapConfig(user="anonymous", email="test@example.org", min_interval=0.0)
+    # No real sleeping in tests; no prefix so the fake's bare names match.
+    cfg = IetfImapConfig(user="anonymous", email="test@example.org", min_interval=0.0, mailbox_prefix="")
     c = IetfImapClient(cfg, imap_factory=lambda: fake)
     c._fake = fake  # expose for assertions
     return c
@@ -175,6 +176,27 @@ def test_examine_is_read_only(client):
     client.page("agent2agent", 0, 2)
     assert any(c.startswith("EXAMINE") for c in client._fake.commands)
     assert not any(c.startswith("SELECT") for c in client._fake.commands)
+
+
+def test_bare_name_gets_shared_folders_prefix(fake_mailboxes):
+    """With the default prefix, a bare list name resolves under Shared Folders/."""
+    msgs = fake_mailboxes["agent2agent"]
+    fake = FakeIMAP({"Shared Folders/agent2agent": msgs})
+    cfg = IetfImapConfig(user="anonymous", email="t@e.org", min_interval=0.0)  # default prefix
+    c = IetfImapClient(cfg, imap_factory=lambda: fake)
+    res = c.page("agent2agent", offset=0, limit=1)
+    assert res["total"] == len(msgs)
+    assert any(cmd == "EXAMINE Shared Folders/agent2agent" for cmd in fake.commands)
+
+
+def test_full_path_passes_through(fake_mailboxes):
+    """A name already containing '/' is not re-prefixed."""
+    msgs = fake_mailboxes["agent2agent"]
+    fake = FakeIMAP({"Shared Folders/agent2agent": msgs})
+    cfg = IetfImapConfig(user="anonymous", email="t@e.org", min_interval=0.0)
+    c = IetfImapClient(cfg, imap_factory=lambda: fake)
+    res = c.page("Shared Folders/agent2agent", offset=0, limit=1)
+    assert res["total"] == len(msgs)
 
 
 def test_mailbox_selection_is_cached(client):
