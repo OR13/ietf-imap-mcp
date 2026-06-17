@@ -15,6 +15,13 @@ dist/
 .coverage
 htmlcov/
 
+# Secrets / local env — never commit credentials
+.env
+.env.*
+!.env.example
+*.pw
+secrets/
+
 # OS / editor
 .DS_Store
 *.swp

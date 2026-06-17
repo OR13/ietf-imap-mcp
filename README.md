@@ -18,32 +18,32 @@ to track what the list is actually saying.
 | `page_list(list_name, offset, limit)` | Page through a list's messages, newest first. |
 | `get_message(list_name, uid, include_body, max_body_chars)` | Fetch one message (headers + plain-text body) by UID. |
 
-## Access & configuration
+## Configuration
 
-Per the [IETF lists page](https://www.ietf.org/participate/lists/), the IMAP
-service supports two modes. Configure via environment variables:
+All configuration is via environment variables — **no credentials are ever
+stored in the code or the repo**.
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `IETF_IMAP_USER` | `anonymous`, or your Datatracker username for authenticated access | `anonymous` |
-| `IETF_IMAP_PASSWORD` | For authenticated access, your Datatracker password. **For anonymous access, your email address** (IMAP uses the password field for it). | — |
-| `IETF_IMAP_EMAIL` | Email used as the anonymous password if `IETF_IMAP_PASSWORD` is unset | — |
+| `IETF_IMAP_USER` | `anonymous`, or your Datatracker username | `anonymous` |
+| `IETF_IMAP_EMAIL` | Email used as the password for **anonymous** access | — |
+| `IETF_IMAP_PASSWORD` | Datatracker password (authenticated access) — plaintext | — |
+| `IETF_IMAP_PASSWORD_CMD` | Shell command whose stdout is the password (e.g. `op read …`) | — |
+| `IETF_IMAP_PASSWORD_FILE` | Path to a file containing the password | — |
 | `IETF_IMAP_MIN_INTERVAL` | Minimum seconds between IMAP commands | `1.0` |
+| `IETF_IMAP_MAILBOX_PREFIX` | Prefix for bare list names | `Shared Folders/` |
 
-**Anonymous access is enough for public list archives** — use
-`IETF_IMAP_USER=anonymous` and put your email in `IETF_IMAP_EMAIL`. Only use
-authenticated (Datatracker) access if you need non-public lists; store that
-password in a secret manager, never in source or shell history.
+See [`.env.example`](.env.example) for a copy-paste starting point.
 
-## Run
+## Authentication
 
-```bash
-uv run ietf-imap-mcp          # stdio MCP server
-# or
-uv run python -m ietf_imap_mcp
-```
+Per the [IETF lists page](https://www.ietf.org/participate/lists/), the IMAP
+service supports two modes.
 
-### Example MCP client config
+### Anonymous (recommended for public lists)
+
+IMAP anonymous login uses your **email address in the password field** — this is
+not a secret. This is all you need for public list archives:
 
 ```json
 {
@@ -55,6 +55,61 @@ uv run python -m ietf_imap_mcp
     }
   }
 }
+```
+
+### Authenticated (Datatracker — only when anonymous is not possible)
+
+Set `IETF_IMAP_USER` to your Datatracker username and supply the password.
+The password is resolved in this order of preference:
+`IETF_IMAP_PASSWORD` → `IETF_IMAP_PASSWORD_CMD` → `IETF_IMAP_PASSWORD_FILE`.
+
+> ⚠️ **Keep the secret out of the config file.** Values in an MCP client's
+> `env` block sit in **plaintext on disk** (and often sync to the cloud). Prefer
+> `IETF_IMAP_PASSWORD_CMD` (resolve from a secret manager at launch) or
+> `IETF_IMAP_PASSWORD_FILE` (a `chmod 600` file). Avoid `IETF_IMAP_PASSWORD`
+> except for throwaway local testing, and never put a real password in a file
+> you commit.
+
+**Recommended — resolve from a secret manager (no secret on disk):**
+
+```json
+{
+  "mcpServers": {
+    "ietf-imap": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/ietf-imap-mcp", "python", "-m", "ietf_imap_mcp"],
+      "env": {
+        "IETF_IMAP_USER": "your-datatracker-username",
+        "IETF_IMAP_PASSWORD_CMD": "op read \"op://Private/IETF Datatracker/password\""
+      }
+    }
+  }
+}
+```
+
+(`op` is the 1Password CLI; substitute `pass`, `gopass`, `security find-generic-password`,
+`vault kv get`, etc.)
+
+**Alternative — a permission-restricted file:**
+
+```bash
+install -m 600 /dev/null ~/.config/ietf-imap/datatracker.pw
+printf '%s' 'your-password' > ~/.config/ietf-imap/datatracker.pw
+```
+
+```json
+"env": {
+  "IETF_IMAP_USER": "your-datatracker-username",
+  "IETF_IMAP_PASSWORD_FILE": "~/.config/ietf-imap/datatracker.pw"
+}
+```
+
+## Run
+
+```bash
+uv run ietf-imap-mcp          # stdio MCP server
+# or
+uv run python -m ietf_imap_mcp
 ```
 
 ## Respecting IETF resources

@@ -213,10 +213,31 @@ class RateLimiter:
 # IMAP client
 # --------------------------------------------------------------------------- #
 
+def _read_password_file(path: str) -> str:
+    with open(os.path.expanduser(path), "r", encoding="utf-8") as fh:
+        return fh.read().strip()
+
+
+def _run_password_cmd(cmd: str) -> str:
+    """Run a shell command and return its stdout (stripped) as the password.
+
+    Lets the secret stay in a manager (e.g. ``op read op://vault/item/password``)
+    instead of sitting in plaintext inside an MCP client config file.
+    """
+    import subprocess
+
+    result = subprocess.run(
+        cmd, shell=True, capture_output=True, text=True, check=True
+    )
+    return result.stdout.strip()
+
+
 @dataclass
 class IetfImapConfig:
     user: str = field(default_factory=lambda: os.environ.get("IETF_IMAP_USER", "anonymous"))
     password: str = field(default_factory=lambda: os.environ.get("IETF_IMAP_PASSWORD", ""))
+    password_file: str = field(default_factory=lambda: os.environ.get("IETF_IMAP_PASSWORD_FILE", ""))
+    password_cmd: str = field(default_factory=lambda: os.environ.get("IETF_IMAP_PASSWORD_CMD", ""))
     email: str = field(default_factory=lambda: os.environ.get("IETF_IMAP_EMAIL", ""))
     min_interval: float = field(
         default_factory=lambda: float(os.environ.get("IETF_IMAP_MIN_INTERVAL", DEFAULT_MIN_INTERVAL))
@@ -228,10 +249,26 @@ class IetfImapConfig:
     )
 
     def resolved_password(self) -> str:
-        """For anonymous access the password is an email address."""
+        """Resolve the password used at login.
+
+        * Anonymous access uses an **email address** as the password (not a
+          secret) — taken from ``IETF_IMAP_PASSWORD`` or ``IETF_IMAP_EMAIL``.
+        * Authenticated (Datatracker) access resolves the real secret in order
+          of preference, favoring forms that keep it out of the MCP config file:
+          ``IETF_IMAP_PASSWORD`` → ``IETF_IMAP_PASSWORD_CMD`` → ``IETF_IMAP_PASSWORD_FILE``.
+        """
         if self.user == "anonymous":
             return self.password or self.email or "anonymous@example.org"
-        return self.password
+        if self.password:
+            return self.password
+        if self.password_cmd:
+            return _run_password_cmd(self.password_cmd)
+        if self.password_file:
+            return _read_password_file(self.password_file)
+        raise ImapError(
+            "Authenticated access requires one of IETF_IMAP_PASSWORD, "
+            "IETF_IMAP_PASSWORD_CMD, or IETF_IMAP_PASSWORD_FILE."
+        )
 
 
 def clamp_results(requested: int, default: int = 25) -> int:
