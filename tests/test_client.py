@@ -1,8 +1,10 @@
 """Client behavior tests against a fake in-memory IMAP server (no network)."""
 
+import imaplib
+
 import pytest
 
-from ietf_imap_mcp.client import IetfImapClient, IetfImapConfig
+from ietf_imap_mcp.client import ImapError, IetfImapClient, IetfImapConfig
 
 
 def make_raw(subject, frm, body, msgid, date="Tue, 17 Jun 2026 10:00:00 +0000"):
@@ -26,6 +28,7 @@ class FakeIMAP:
         self.mailboxes = mailboxes
         self.selected = None
         self.logged_in = False
+        self.shutdown_called = False
         self.commands: list[str] = []   # audit log for assertions
 
     def login(self, user, password):
@@ -74,12 +77,39 @@ class FakeIMAP:
         self.logged_in = False
         return ("BYE", [b"bye"])
 
+    def shutdown(self):
+        self.shutdown_called = True
+
     def _raw(self, uid):
         for msgs in self.mailboxes.values():
             for u, raw in msgs:
                 if u == uid:
                     return raw
         return None
+
+
+class FlakyIMAP(FakeIMAP):
+    """A FakeIMAP whose data commands raise a connection-death error.
+
+    Simulates the real failure: login + EXAMINE succeed, then the kept-alive
+    socket is dead by the time a data command (SEARCH / FETCH) runs.
+    """
+
+    def __init__(self, mailboxes, *, fail_commands=(), exc=None):
+        super().__init__(mailboxes)
+        self.fail_commands = set(fail_commands)
+        self.exc = exc if exc is not None else imaplib.IMAP4.abort("connection lost")
+        self.shutdown_called = False
+
+    def uid(self, command, *args):
+        if command in self.fail_commands:
+            raise self.exc
+        return super().uid(command, *args)
+
+    def fetch(self, seqset, spec):
+        if "FETCH" in self.fail_commands:
+            raise self.exc
+        return super().fetch(seqset, spec)
 
 
 @pytest.fixture
@@ -205,3 +235,87 @@ def test_mailbox_selection_is_cached(client):
     client.page("agent2agent", 2, 2)
     examines = [c for c in client._fake.commands if c.startswith("EXAMINE agent2agent")]
     assert len(examines) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Connection self-healing: a dropped/corrupted socket must reconnect, not wedge.
+# --------------------------------------------------------------------------- #
+
+def _reconnecting_client(conns):
+    """A client whose factory hands out the given connections in order."""
+    it = iter(conns)
+    cfg = IetfImapConfig(user="anonymous", email="t@e.org", min_interval=0.0, mailbox_prefix="")
+    return IetfImapClient(cfg, imap_factory=lambda: next(it))
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        imaplib.IMAP4.abort("connection lost"),   # imaplib's mid-command drop
+        BrokenPipeError("broken pipe"),           # OSError family
+        OSError("[SSL: BAD_LENGTH] bad length"),  # the exact symptom we saw live
+        EOFError("server hung up"),
+    ],
+)
+def test_reconnects_after_dropped_connection(fake_mailboxes, exc):
+    poisoned = FlakyIMAP(fake_mailboxes, fail_commands={"SEARCH"}, exc=exc)
+    healthy = FakeIMAP(fake_mailboxes)
+    client = _reconnecting_client([poisoned, healthy])
+
+    res = client.search("agent2agent", subject="msg", limit=3)
+
+    assert res["returned"] == 3                 # the call succeeded after reconnect
+    assert poisoned.shutdown_called is True     # the dead connection was torn down
+    assert healthy.logged_in is True            # a fresh connection logged in
+
+
+def test_page_reconnects_after_dropped_connection(fake_mailboxes):
+    poisoned = FlakyIMAP(fake_mailboxes, fail_commands={"FETCH"})
+    healthy = FakeIMAP(fake_mailboxes)
+    client = _reconnecting_client([poisoned, healthy])
+
+    res = client.page("agent2agent", offset=0, limit=2)
+
+    assert [m["uid"] for m in res["messages"]] == ["110", "109"]
+    assert poisoned.shutdown_called is True
+
+
+def test_persistent_connection_failure_raises_imaperror(fake_mailboxes):
+    """If reconnect also fails, surface a clean ImapError (not a raw socket error)."""
+    conns = [
+        FlakyIMAP(fake_mailboxes, fail_commands={"SEARCH"}),
+        FlakyIMAP(fake_mailboxes, fail_commands={"SEARCH"}),
+    ]
+    client = _reconnecting_client(conns)
+
+    with pytest.raises(ImapError, match="reconnect failed"):
+        client.search("agent2agent", subject="msg")
+
+
+def test_command_error_is_not_retried(fake_mailboxes):
+    """A command-level failure (missing uid) must not throw away the connection."""
+    made = []
+
+    def factory():
+        f = FakeIMAP(fake_mailboxes)
+        made.append(f)
+        return f
+
+    cfg = IetfImapConfig(user="anonymous", email="t@e.org", min_interval=0.0, mailbox_prefix="")
+    client = IetfImapClient(cfg, imap_factory=factory)
+
+    with pytest.raises(ImapError):
+        client.get_message("agent2agent", 99999)  # no such uid
+
+    assert len(made) == 1  # only one connection — no spurious reconnect
+
+
+def test_recovers_on_next_call_after_reset(fake_mailboxes):
+    """After a connection is reset, a subsequent independent call still works."""
+    poisoned = FlakyIMAP(fake_mailboxes, fail_commands={"SEARCH"})
+    healthy = FakeIMAP(fake_mailboxes)
+    client = _reconnecting_client([poisoned, healthy])
+
+    client.search("agent2agent", subject="msg", limit=1)  # triggers reconnect
+    res = client.get_message("agent2agent", 105)           # reuses healthy conn
+    assert res["uid"] == "105"

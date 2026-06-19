@@ -277,6 +277,16 @@ def clamp_results(requested: int, default: int = 25) -> int:
     return min(requested, MAX_RESULTS_CEILING)
 
 
+# Errors that mean the kept-alive TLS connection is dead and must be rebuilt
+# rather than reused. ``imaplib.IMAP4.abort`` is raised on a lost connection
+# mid-command; ``OSError`` covers broken pipes, connection resets, and
+# ``ssl.SSLError`` (e.g. ``BAD_LENGTH`` on a corrupted socket); ``EOFError`` is
+# raised when the server hangs up. Plain ``imaplib.IMAP4.error`` is deliberately
+# excluded — those are command-level failures (bad mailbox, auth) that a
+# reconnect would not fix.
+_CONNECTION_ERRORS = (imaplib.IMAP4.abort, OSError, EOFError)
+
+
 class IetfImapClient:
     """Thin, read-only, rate-limited wrapper over ``imaplib.IMAP4_SSL``."""
 
@@ -305,9 +315,47 @@ class IetfImapClient:
             if self._conn is not None:
                 try:
                     self._conn.logout()
+                except Exception:
+                    # The connection may already be dead; tearing it down
+                    # cleanly is best-effort, not something to raise over.
+                    pass
                 finally:
                     self._conn = None
                     self._selected = None
+
+    def _reset_connection(self) -> None:
+        """Discard the current connection so the next call reconnects.
+
+        Tears down the socket without a LOGOUT roundtrip (which would itself
+        fail or hang on an already-dead connection).
+        """
+        conn, self._conn, self._selected = self._conn, None, None
+        if conn is not None:
+            try:
+                conn.shutdown()
+            except Exception:
+                pass
+
+    def _execute(self, op):
+        """Run ``op()`` under the lock, reconnecting once if the link is dead.
+
+        The kept-alive TLS connection can be dropped by the server or corrupted
+        between calls. On a connection-level error we throw the stale connection
+        away and retry exactly once on a fresh one; a second failure is surfaced
+        as an :class:`ImapError`.
+        """
+        with self._lock:
+            try:
+                return op()
+            except _CONNECTION_ERRORS:
+                self._reset_connection()
+                try:
+                    return op()
+                except _CONNECTION_ERRORS as exc:
+                    self._reset_connection()
+                    raise ImapError(
+                        f"IMAP connection lost and reconnect failed: {exc}"
+                    ) from exc
 
     def _normalize(self, name: str) -> str:
         """Map a bare list name to its full mailbox path (idempotent)."""
@@ -333,7 +381,7 @@ class IetfImapClient:
     # -- operations ---------------------------------------------------------- #
 
     def list_mailboxes(self, pattern: str = "*", limit: int = MAX_RESULTS_CEILING) -> list[str]:
-        with self._lock:
+        def _op():
             conn = self._connect()
             self._rl.wait()
             # imap.ietf.org requires quoted reference + pattern.
@@ -343,6 +391,8 @@ class IetfImapClient:
             names = [_parse_list_line(line) for line in data if line]
             names = [n for n in names if n]
             return sorted(set(names))[:limit]
+
+        return self._execute(_op)
 
     def search(
         self,
@@ -357,9 +407,10 @@ class IetfImapClient:
     ) -> dict:
         limit = clamp_results(limit)
         mailbox = self._normalize(mailbox)
-        with self._lock:
+        charset, criteria = build_search_criteria(subject, from_addr, text, since, before)
+
+        def _op():
             total = self._examine(mailbox)
-            charset, criteria = build_search_criteria(subject, from_addr, text, since, before)
             conn = self._connect()
             self._rl.wait()
             typ, data = conn.uid("SEARCH", charset, *criteria) if charset else conn.uid("SEARCH", *criteria)
@@ -378,10 +429,13 @@ class IetfImapClient:
                 "messages": messages,
             }
 
+        return self._execute(_op)
+
     def page(self, mailbox: str, offset: int = 0, limit: int = 25) -> dict:
         limit = clamp_results(limit)
         mailbox = self._normalize(mailbox)
-        with self._lock:
+
+        def _op():
             total = self._examine(mailbox)
             rng = compute_page_range(total, offset, limit)
             if rng is None:
@@ -408,9 +462,12 @@ class IetfImapClient:
                 "messages": messages,
             }
 
+        return self._execute(_op)
+
     def get_message(self, mailbox: str, uid: str | int, include_body=True, max_body_chars=20000) -> dict:
         mailbox = self._normalize(mailbox)
-        with self._lock:
+
+        def _op():
             self._examine(mailbox)
             conn = self._connect()
             self._rl.wait()
@@ -424,6 +481,8 @@ class IetfImapClient:
             parsed["uid"] = str(uid)
             parsed["mailbox"] = mailbox
             return parsed
+
+        return self._execute(_op)
 
     def _summary(self, mailbox: str, uid: bytes | str) -> dict:
         conn = self._connect()
